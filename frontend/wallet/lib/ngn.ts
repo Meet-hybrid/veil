@@ -1,5 +1,6 @@
 /**
- * Buying crypto with naira, through Linq — the web half of the mobile rails.
+ * Buying crypto with naira and paying Nigerian bills, through Linq — the web
+ * half of the mobile rails (`frontend/mobile/lib/onramp.ts`).
  *
  * Every call goes through wraith, never to Linq directly: the Linq API key is
  * the ability to create orders that move real naira, and a key shipped to a
@@ -21,6 +22,9 @@
  * account number, transfers naira from their own bank app, and Linq delivers
  * the crypto to their classic address. That is also why this works on a wallet
  * that has never been deployed: receiving needs no contract and no passkey.
+ * Bill reservations (`payBill`) work the same way at the HTTP layer — this
+ * module reserves the order and locks the rate, and the wallet signs the
+ * Stellar deposit only after the order exists.
  *
  * Deliberately a sibling of `frontend/mobile/lib/onramp.ts` rather than a
  * shared module — the two use different storage primitives — but the wire
@@ -495,6 +499,58 @@ export interface OnrampStatus {
 export function getOnrampStatus(customerRef: string, orderId: string): Promise<OnrampStatus> {
   return call<OnrampStatus>(
     `/ngn/onramp/orders/${encodeURIComponent(orderId)}?customerRef=${encodeURIComponent(customerRef)}`,
+  )
+}
+
+// ─── Bills ───────────────────────────────────────────────────────────────────
+
+export type BillCategory = 'airtime' | 'data' | 'electricity' | 'cabletv' | 'betting'
+
+export interface BillOrder {
+  id: string
+  customerRef: string
+  /** Where the wallet sends the crypto. Nothing is vended until it arrives. */
+  wallet: string
+  status: string
+}
+
+/**
+ * Reserve a bill and lock the rate.
+ *
+ * `refundAddress` is where the deposit goes if the biller rejects the top-up
+ * **after** the user has paid — a biller failing does not un-spend their XLM.
+ * It must be the classic `G…` account of a wallet the user controls.
+ */
+export function payBill(params: {
+  customerRef: string
+  billCategory: BillCategory
+  provider: string
+  /** The phone number for airtime, the meter number for electricity. */
+  customerId: string
+  amountNgn: number
+  amountStableCoin: number
+  rate: number
+  coin: NairaCoin
+  refundAddress: string
+}): Promise<BillOrder> {
+  return call<BillOrder>('/ngn/bills', { method: 'POST', body: params })
+}
+
+export interface BillStatus {
+  orderId: string
+  customerRef: string
+  status: string
+  billCategory: string
+  amountNgn: number
+  amountStableCoin: number
+  wallet: string
+  description: string
+  stale?: boolean
+}
+
+export function getBillStatus(customerRef: string, orderId: string): Promise<BillStatus> {
+  return call<BillStatus>(
+    `/ngn/bills/${encodeURIComponent(orderId)}?customerRef=${encodeURIComponent(customerRef)}`,
   )
 }
 
