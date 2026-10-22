@@ -519,6 +519,7 @@ export interface BillOrder {
  *
  * `refundAddress` is where the deposit goes if the biller rejects the top-up
  * **after** the user has paid — a biller failing does not un-spend their XLM.
+ * after the user has paid — a biller failing does not un-spend their XLM.
  * It must be the classic `G…` account of a wallet the user controls.
  */
 export function payBill(params: {
@@ -553,6 +554,25 @@ export function getBillStatus(customerRef: string, orderId: string): Promise<Bil
     `/ngn/bills/${encodeURIComponent(orderId)}?customerRef=${encodeURIComponent(customerRef)}`,
   )
 }
+
+export type BillTerminalOutcome = 'done' | 'failed' | 'pending'
+
+/**
+ * Classifies a bill order status into terminal or in-flight states.
+ *
+ * The provider confirms the real success status is literally `completed`.
+ * We also recognize `complete`, `success`, and `delivered`.
+ * Failure statuses: `failed`, `refunded`, `reversed`, `cancelled`.
+ * All other / unrecognized statuses default to `pending` so requerying
+ * can settle them rather than assuming a false failure.
+ */
+export function classifyBillStatus(status: string): BillTerminalOutcome {
+  const s = status.trim().toLowerCase()
+  if (/complete|success|delivered/.test(s)) return 'done'
+  if (/fail|refund|revers|cancel/.test(s)) return 'failed'
+  return 'pending'
+}
+
 
 /** Whether the rails are open at all. USDC on purpose — the XLM rate additionally
  *  depends on a live order book, so asking for it would hide the whole naira
