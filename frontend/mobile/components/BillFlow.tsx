@@ -46,6 +46,7 @@ import { errorMessage } from '../lib/errorMessage';
 import { getAssetIssuer } from '../lib/assets';
 import { getFeePayerAddress } from '../lib/activity';
 import { NotEnoughToSend, previewSpendFee } from '../lib/spendAsset';
+import { isPasskeyCancellation } from '../lib/passkeyOutcome';
 import type { PlatformFee } from '../lib/platformFee';
 import {
   getBillStatus,
@@ -251,6 +252,13 @@ export function BillFlow({
       setPayHash(txHash);
     } catch (err) {
       setWaitingForPasskey(false);
+      // Back to the confirmation with the order intact and no red error: the
+      // user simply chose not to authorise, and no crypto left the wallet.
+      if (isPasskeyCancellation(err)) {
+        setError(null);
+        setStep('confirm');
+        return;
+      }
       if (err instanceof NotEnoughToSend) {
         const noun = copy.insufficientBalanceNoun ?? 'top-up';
         setError(
