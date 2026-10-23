@@ -28,6 +28,25 @@ import { ContactIcon } from '../components/icons';
 import { useTheme } from '../hooks/useTheme';
 import type { BillCategoryConfig } from '../lib/billFlow';
 import { pickContactNumber } from '../lib/pickContact';
+import { useNetwork } from '../hooks/useNetwork';
+import type { ThemeColors } from '../lib/theme';
+import { fontFamily } from '../theme/typography';
+import { errorMessage } from '../lib/errorMessage';
+import { getAssetIssuer } from '../lib/assets';
+import { getFeePayerAddress } from '../lib/activity';
+import { NotEnoughToSend, previewSpendFee, spendAsset } from '../lib/spendAsset';
+import { isPasskeyCancellation } from '../lib/passkeyOutcome';
+import type { PlatformFee } from '../lib/platformFee';
+import {
+  getBillStatus,
+  getCustomerRef,
+  isNairaVerified,
+  getOnrampRate,
+  payBill,
+  type NairaCoin,
+} from '../lib/onramp';
+
+type Step = 'form' | 'confirm' | 'paying' | 'done' | 'failed';
 
 const QUICK_AMOUNTS = [200, 500, 1000, 2000] as const;
 
@@ -137,6 +156,79 @@ export default function AirtimeScreen() {
     () => buildAirtimeCategoryConfig({ provider, phone }),
     [provider, phone],
   );
+  const continueFromForm = useCallback(async () => {
+    if (await isNairaVerified()) {
+      setStep('confirm');
+      return;
+    }
+    router.push({
+      pathname: '/verify',
+      params: {
+        returnTo: '/airtime',
+        label: 'Airtime',
+        summary: `Airtime · ₦${ngn.toLocaleString('en-NG')} to ${phone}`,
+      },
+    });
+  }, [router, ngn, phone]);
+
+  const phoneValid = phoneDigits.length === 11 && phoneDigits.startsWith('0');
+
+  const pay = useCallback(async () => {
+    if (!customerRef || !refundAddress || !rate) return;
+    setStep('paying');
+    setError(null);
+    try {
+      // Reserve first, spend second. A reservation that fails costs nothing;
+      // a spend with no order behind it is money sent to an address that was
+      // never expecting it.
+      const amountStableCoin = Number((ngn / rate).toFixed(7));
+      const order = await payBill({
+        customerRef,
+        billCategory: 'airtime',
+        provider,
+        customerId: phoneDigits,
+        amountNgn: ngn,
+        amountStableCoin,
+        rate,
+        coin,
+        refundAddress,
+      });
+      setOrderId(order.id);
+      setSpent(amountStableCoin);
+
+      setWaitingForPasskey(true);
+      const issuer = coin === 'usdc' ? getAssetIssuer('USDC', 'mainnet') : null;
+      const hash = await spendAsset({
+        to: order.wallet,
+        // From the order, not from the screen: Linq settles at whatever
+        // arrives, so an amount that drifted would quietly buy less airtime.
+        amount: String(amountStableCoin),
+        ...(issuer ? { asset: { code: 'USDC', issuer } } : {}),
+        deploy: wallet.deploy,
+      });
+      setWaitingForPasskey(false);
+      setPayHash(hash);
+    } catch (err) {
+      setWaitingForPasskey(false);
+      // Back to the confirmation with the order intact and no red error: the
+      // user simply chose not to authorise, and no crypto left the wallet.
+      if (isPasskeyCancellation(err)) {
+        setError(null);
+        setStep('confirm');
+        return;
+      }
+      if (err instanceof NotEnoughToSend) {
+        setError(
+          `This wallet holds ${err.available.toLocaleString('en-US', { maximumFractionDigits: 7 })} ${code}, less than this top-up needs.`,
+        );
+      } else {
+        setError(errorMessage(err));
+      }
+      setStep('confirm');
+    }
+  }, [customerRef, refundAddress, rate, ngn, provider, phoneDigits, coin, wallet.deploy, code]);
+
+  const stepNumber = step === 'form' ? 1 : 2;
 
   return (
     <BillFlow

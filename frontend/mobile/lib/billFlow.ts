@@ -45,6 +45,18 @@
  *     network auto-detection, network override chips, phone input, and contact
  *     picker; for electricity/TV: meter or smartcard input and lookup)
  *   - `copy`: category-specific labels, confirmation rows, and status prose
+ * Shared bill payment machinery and per-category seam from V296.
+ *
+ * Every Nigerian bill category (`airtime`, `data`, `electricity`, `cabletv`, `betting`)
+ * moves money the same way:
+ *   1. Gate on mainnet (Linq has no sandbox; every call moves real money).
+ *   2. Resolve customerRef and classic G… refundAddress (fee-payer account).
+ *   3. Quote live NGN rate per coin (usdc / xlm).
+ *   4. Gate confirm step on one-time NIN check (`isNairaVerified`).
+ *   5. Preview platform fee on confirm step (`previewSpendFee`) before passkey prompt.
+ *   6. Reserve order first (`payBill`) to lock rate and get deposit address, then spend
+ *      exact locked amount (`spendAsset`).
+ *   7. Poll `getBillStatus` with bounded retry budget and distinguish `unconfirmed` from `failed`.
  */
 
 import type { DeployFn } from './deployWallet';
@@ -58,6 +70,7 @@ import {
 import { spendAsset } from './spendAsset';
 
 export type BillStep = 'form' | 'confirm' | 'paying' | 'done' | 'failed';
+export type BillStep = 'form' | 'confirm' | 'paying' | 'done' | 'failed' | 'unconfirmed';
 
 export type BillRateState = 'loading' | 'ready' | 'failed';
 
@@ -131,6 +144,35 @@ export interface BillCategoryConfig {
   /** Quick NGN amount chips shown below the amount input. */
   quickAmounts?: readonly number[];
   /** Category-specific copy and summary rows for each step. */
+export interface BillCategoryCopy {
+  mainnetTitle: string;
+  mainnetHint: string;
+  insufficientBalanceNoun?: string;
+  verifySummary: (amountFormatted: string) => string;
+  confirmQuestion: (amountFormatted: string) => string;
+  confirmRows: BillSummaryRow[];
+  refundNote: string;
+  payingTitle: string;
+  payingHint: (amountFormatted: string) => string;
+  payingWaitLabel: string;
+  payingSummaryLabel: string;
+  payingSummaryValue: (amountFormatted: string) => string;
+  doneTitle: string;
+  doneHint: (amountFormatted: string) => string;
+  doneRows: BillSummaryRow[];
+  doneAgainLabel?: string;
+  failedHint: (spentFormatted: string) => string;
+  failedReasonLabel: string;
+}
+
+export interface BillCategoryConfig {
+  category: BillCategory;
+  title: string;
+  returnTo: string;
+  provider: string;
+  customerId: string;
+  customerValid: boolean;
+  quickAmounts?: readonly number[];
   copy: BillCategoryCopy;
 }
 
@@ -174,6 +216,7 @@ export function canContinueBillForm(params: {
 export function classifyBillPollStatus(status: string): 'done' | 'failed' | 'pending' {
   if (/complete|success|delivered/i.test(status)) return 'done';
   if (/fail|refund|revers/i.test(status)) return 'failed';
+  if (/fail|refund|revers|cancel/i.test(status)) return 'failed';
   return 'pending';
 }
 

@@ -26,6 +26,11 @@ import * as Crypto from 'expo-crypto';
 import { getNetwork } from './network';
 import { inclusionFee } from './fees';
 import {
+  PASSKEY_CANCELLED_MESSAGE,
+  PasskeyCeremonyError,
+  isPasskeyCancellation,
+} from './passkeyOutcome';
+import {
   WALLET_CONNECT_EVENTS,
   WALLET_CONNECT_METHODS,
   buildWcError,
@@ -37,7 +42,12 @@ import {
   parseWalletConnectRequest,
   parseWalletConnectSession,
 } from './walletConnectHelpers';
-import { getSignerSecret } from './walletStore';
+import { getSignerSecret, getWalletAddress } from './walletStore';
+import {
+  createSep43Wallet,
+  signSorobanAuthEntry,
+  type Sep43Wallet,
+} from 'invisible-wallet-sdk';
 
 export type {
   WalletConnectPeer,
@@ -334,7 +344,10 @@ export async function signXdrPayload(xdrString: string): Promise<string> {
 
       const webAuthnSig = await signAuthEntry(payloadHash);
       if (!webAuthnSig) {
-        throw new Error('USER_REJECTED');
+        // The contract path signs inside the ceremony, so a dismissed sheet
+        // must still arrive at the spend screen as a cancellation rather than
+        // a generic rejection.
+        throw new PasskeyCeremonyError('cancelled', PASSKEY_CANCELLED_MESSAGE);
       }
 
       const sigElements = [
@@ -401,6 +414,54 @@ async function signAndSubmitXdr(xdrString: string): Promise<string> {
   return sendResult.hash;
 }
 
+export function getMobileSep43Wallet(): Sep43Wallet {
+  return createSep43Wallet({
+    getAddress: async () => getWalletAddress(),
+    getNetwork: () => {
+      const net = getNetwork();
+      return {
+        network: net.name === 'mainnet' ? 'PUBLIC' : 'TESTNET',
+        networkPassphrase: net.networkPassphrase,
+        rpcUrl: net.rpcUrl,
+      };
+    },
+    signTransaction: async (xdrString) => {
+      return signXdrPayload(xdrString);
+    },
+    signAuthEntry: async (authEntryXdr, opts) => {
+      const walletAddress = await getWalletAddress();
+      if (!walletAddress) throw new Error('No wallet registered');
+      const network = getNetwork();
+      const rpc = getRpcServer();
+      const latestLedger = await rpc.getLatestLedger();
+      const feePayerKeypair = await getFeePayerKeypair();
+      return signSorobanAuthEntry(authEntryXdr, {
+        signerAddress: walletAddress,
+        networkPassphrase: opts?.networkPassphrase ?? network.networkPassphrase,
+        signPayload: async (payloadHash) => {
+          if (!_authEntrySigner) {
+            throw new Error('No auth entry signer registered in mobile wallet.');
+          }
+          return _authEntrySigner(payloadHash);
+        },
+        validUntilLedger: latestLedger.sequence + 100,
+        getNonce: async (contractAddress) =>
+          getWalletNonce(rpc, contractAddress, network.networkPassphrase, feePayerKeypair.publicKey()),
+      });
+    },
+    submitTransaction: async (signedXdr) => {
+      const network = getNetwork();
+      const rpc = getRpcServer();
+      const tx = TransactionBuilder.fromXDR(signedXdr, network.networkPassphrase);
+      const res = await rpc.sendTransaction(tx);
+      if (res.status === 'ERROR') {
+        throw new Error(rejectionFromResult(res.errorResult));
+      }
+      return res.hash;
+    },
+  });
+}
+
 // ── Request handling ──────────────────────────────────────────────────────────
 
 /**
@@ -411,31 +472,104 @@ async function signAndSubmitXdr(xdrString: string): Promise<string> {
 export async function approveWalletConnectRequest(request: WalletConnectRequest): Promise<void> {
   const client = await getWalletConnectClient();
   const { topic, id, method, params } = request;
+  const sep43Wallet = getMobileSep43Wallet();
 
-  if (method !== 'stellar_signXDR' && method !== 'stellar_signAndSubmitXDR') {
+  try {
+    if (method === 'stellar_signXDR') {
+      const xdrString = extractRequestXdr(params);
+      if (!xdrString) {
+        throw new Error('Missing XDR payload in WalletConnect request.');
+      }
+      const result = await sep43Wallet.signTransaction(xdrString);
+      if (result.error) throw new Error(result.error.message);
+      await client.respondSessionRequest({
+        topic,
+        response: buildWcResult(id, { signedXDR: result.signedTxXdr }),
+      });
+      removePendingRequest(id, topic);
+      return;
+    }
+
+    if (method === 'stellar_signAndSubmitXDR') {
+      const xdrString = extractRequestXdr(params);
+      if (!xdrString) {
+        throw new Error('Missing XDR payload in WalletConnect request.');
+      }
+      const txHash = await signAndSubmitXdr(xdrString);
+      await client.respondSessionRequest({
+        topic,
+        response: buildWcResult(id, { txHash }),
+      });
+      removePendingRequest(id, topic);
+      return;
+    }
+
+    if (method === 'stellar_signAuthEntry') {
+      const authEntryXdr =
+        typeof params === 'string'
+          ? params
+          : (params as any)?.authEntry ?? (params as any)?.entry ?? (Array.isArray(params) ? params[0] : '');
+      const result = await sep43Wallet.signAuthEntry(authEntryXdr);
+      if (result.error) throw new Error(result.error.message);
+      await client.respondSessionRequest({
+        topic,
+        response: buildWcResult(id, { signedAuthEntry: result.signedAuthEntry, signerAddress: result.signerAddress }),
+      });
+      removePendingRequest(id, topic);
+      return;
+    }
+
+    if (method === 'stellar_signMessage') {
+      const message =
+        typeof params === 'string'
+          ? params
+          : (params as any)?.message ?? (Array.isArray(params) ? params[0] : '');
+      const result = await sep43Wallet.signMessage(message);
+      if (result.error) throw new Error(result.error.message);
+      await client.respondSessionRequest({
+        topic,
+        response: buildWcResult(id, { signedMessage: result.signedMessage, signerAddress: result.signerAddress }),
+      });
+      removePendingRequest(id, topic);
+      return;
+    }
+
+    if (method === 'stellar_getAccount' || method === 'stellar_getAddress') {
+      const result = await sep43Wallet.getAddress();
+      if (result.error) throw new Error(result.error.message);
+      await client.respondSessionRequest({
+        topic,
+        response: buildWcResult(id, { address: result.address }),
+      });
+      removePendingRequest(id, topic);
+      return;
+    }
+
+    if (method === 'stellar_getNetwork') {
+      const result = await sep43Wallet.getNetwork();
+      if (result.error) throw new Error(result.error.message);
+      await client.respondSessionRequest({
+        topic,
+        response: buildWcResult(id, result),
+      });
+      removePendingRequest(id, topic);
+      return;
+    }
+
     await client.respondSessionRequest({
       topic,
       response: buildWcError(id, 10001, `Unsupported method: ${String(method)}`),
     });
     removePendingRequest(id, topic);
     throw new Error(`Unsupported method: ${String(method)}`);
-  }
-
-  try {
-    const xdrString = extractRequestXdr(params);
-    if (!xdrString) {
-      throw new Error('Missing XDR payload in WalletConnect request.');
-    }
-
-    const result =
-      method === 'stellar_signXDR'
-        ? { signedXDR: await signXdrPayload(xdrString) }
-        : { txHash: await signAndSubmitXdr(xdrString) };
-
-    await client.respondSessionRequest({ topic, response: buildWcResult(id, result) });
-    removePendingRequest(id, topic);
   } catch (error: unknown) {
-    const reason = isUserRejection(error) ? getSdkError('USER_REJECTED') : null;
+    // A ceremony cancellation is the user declining; a ceremony refusal is not.
+    // isUserRejection covers WalletConnect's own USER_REJECTED code, so both are
+    // checked rather than widening either helper's text matching.
+    const reason =
+      isUserRejection(error) || isPasskeyCancellation(error)
+        ? getSdkError('USER_REJECTED')
+        : null;
     const response = reason
       ? buildWcError(id, reason.code, reason.message)
       : buildWcError(id, 5000, errorMessage(error));
