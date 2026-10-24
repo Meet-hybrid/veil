@@ -28,6 +28,26 @@ import { ContactIcon } from '../components/icons';
 import { useTheme } from '../hooks/useTheme';
 import type { BillCategoryConfig } from '../lib/billFlow';
 import { pickContactNumber } from '../lib/pickContact';
+import { useNetwork } from '../hooks/useNetwork';
+import type { ThemeColors } from '../lib/theme';
+import { fontFamily } from '../theme/typography';
+import { errorMessage } from '../lib/errorMessage';
+import { getAssetIssuer } from '../lib/assets';
+import { getFeePayerAddress } from '../lib/activity';
+import { NotEnoughToSend, previewSpendFee, spendAsset } from '../lib/spendAsset';
+import { isPasskeyCancellation } from '../lib/passkeyOutcome';
+import type { PlatformFee } from '../lib/platformFee';
+import {
+  getBillStatus,
+  getCustomerRef,
+  isNairaVerified,
+  getOnrampRate,
+  payBill,
+  type NairaCoin,
+} from '../lib/onramp';
+import { classifyBillPollStatus } from '../lib/billFlow';
+
+type Step = 'form' | 'confirm' | 'paying' | 'done' | 'failed';
 
 const QUICK_AMOUNTS = [200, 500, 1000, 2000] as const;
 
@@ -122,6 +142,105 @@ export default function AirtimeScreen() {
     if (detected && !providerTouched) setProvider(detected);
   }, [detected, providerTouched]);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [addr, ref] = await Promise.all([
+        getFeePayerAddress().catch(() => null),
+        getCustomerRef().catch(() => null),
+      ]);
+      if (cancelled) return;
+      setRefundAddress(addr);
+      setCustomerRef(ref);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const loadRate = useCallback(async () => {
+    if (mainnetOnly) return;
+    setRateState('loading');
+    try {
+      // Per coin: the two are different prices, so switching the toggle has to
+      // re-fetch rather than reuse whatever the other one quoted.
+      setRate(await getOnrampRate(coin));
+      setRateState('ready');
+    } catch {
+      setRate(null);
+      setRateState('failed');
+    }
+  }, [mainnetOnly, coin]);
+
+  useEffect(() => {
+    void loadRate();
+  }, [loadRate]);
+
+  // Poll the vend result. Unlike the onramp, nothing on-chain says whether the
+  // airtime landed — the deposit leaving this wallet is visible, the top-up is
+  // not — so asking is the only way to know.
+  useEffect(() => {
+    if (!orderId || !customerRef || step !== 'paying' || !payHash) return;
+    const check = async () => {
+      try {
+        const s = await getBillStatus(customerRef, orderId);
+        // One classifier for every bill screen. This used to be an inline
+        // regex that did not know "settled"/"disbursed" — the words Linq
+        // actually ends a vend with — so a delivered top-up never left this
+        // screen.
+        const outcome = classifyBillPollStatus(s.status);
+        if (outcome === 'done') setStep('done');
+        if (outcome === 'failed') setStep('failed');
+      } catch (err) {
+        // Silent *to the user*: a failed poll is nothing they can act on, and
+        // the payment has already left, so an error here would read as if it
+        // had not. But silent to us as well is how a top-up that landed sat on
+        // a spinner with no way to find out why — the status was fine, the
+        // request never got there, and nothing anywhere said so.
+        console.warn('[airtime] status poll failed:', errorMessage(err));
+      }
+    };
+    void check();
+    pollRef.current = setInterval(check, 10_000);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = null;
+    };
+  }, [orderId, customerRef, step, payHash]);
+
+  const ngn = Number(amountNGN.replace(/[^\d]/g, '')) || 0;
+  const code = coin.toUpperCase();
+  const cost = rate && ngn > 0 ? ngn / rate : 0;
+
+  // Only on the confirm step: it reads two balances, and doing that on every
+  // keystroke of the amount field would be a request per digit.
+  useEffect(() => {
+    if (step !== 'confirm' || cost <= 0) return;
+    let cancelled = false;
+    void (async () => {
+      const issuer = coin === 'usdc' ? getAssetIssuer('USDC', 'mainnet') : null;
+      const fee = await previewSpendFee({
+        amount: String(cost),
+        ...(issuer ? { asset: { code: 'USDC', issuer } } : {}),
+      }).catch(() => null);
+      if (!cancelled) setVeilFee(fee);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [step, cost, coin]);
+  const phoneDigits = phone.replace(/\D/g, '');
+
+  /**
+   * The one-time NIN check, which this screen never used to ask for.
+   *
+   * Linq refuses a bill from an unverified customer, so the old path let
+   * someone fill in a phone number and an amount, tap through to confirm, and
+   * meet "customer … has not completed KYC" at the moment they expected a
+   * payment — which is the worst place to learn a rule exists. The check now
+   * happens before the summary, and `/verify` is handed enough to bring them
+   * back to exactly this airtime purchase.
+   */
   const chooseContact = useCallback(async () => {
     const picked = await pickContactNumber();
     if (picked.ok) {
