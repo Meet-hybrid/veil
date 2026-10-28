@@ -24,6 +24,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, Text, TextInput, View } from 'react-native';
 
 import { BillFlow, createBillFlowStyles } from '../components/BillFlow';
+import * as Clipboard from 'expo-clipboard';
 import { ContactIcon } from '../components/icons';
 import { useTheme } from '../hooks/useTheme';
 import type { BillCategoryConfig } from '../lib/billFlow';
@@ -45,6 +46,18 @@ import {
   payBill,
   type NairaCoin,
 } from '../lib/onramp';
+import {
+  getCategoryDeclaration,
+  validateIdentifierBeforeConfirm,
+} from '../lib/billCategories';
+import { RecentBillOrders } from '../components/RecentBillOrders';
+import {
+  getBillOrders,
+  recheckPendingBillOrders,
+  saveBillOrder,
+  updateBillOrderStatus,
+  type PersistedBillOrder,
+} from '../lib/billOrders';
 import { classifyBillPollStatus } from '../lib/billFlow';
 
 type Step = 'form' | 'confirm' | 'paying' | 'done' | 'failed';
@@ -134,6 +147,60 @@ export default function AirtimeScreen() {
   const [contactError, setContactError] = useState<string | null>(null);
 
   const phoneDigits = phone.replace(/\D/g, '');
+  const [amountNGN, setAmountNGN] = useState('');
+  const [coin, setCoin] = useState<NairaCoin>('usdc');
+
+  const [rate, setRate] = useState<number | null>(null);
+  const [rateState, setRateState] = useState<'loading' | 'ready' | 'failed'>('loading');
+
+  const [customerRef, setCustomerRef] = useState<string | null>(null);
+  const [refundAddress, setRefundAddress] = useState<string | null>(null);
+
+  const [orderId, setOrderId] = useState<string | null>(null);
+  const [payHash, setPayHash] = useState<string | null>(null);
+  const [accountHolderName, setAccountHolderName] = useState<string | null>(null);
+  const [prepaidToken, setPrepaidToken] = useState<string | null>(null);
+  const [tokenCopied, setTokenCopied] = useState(false);
+  const [recentOrders, setRecentOrders] = useState<PersistedBillOrder[]>([]);
+  const [isRechecking, setIsRechecking] = useState(false);
+  // Shown before the passkey, never after. A charge a user only finds in
+  // their history is a surprise, not a fee — and `previewSpendFee` decides it
+  // exactly the way `spendAsset` will, so the number shown is the number
+  // taken. Null when nothing will be charged, which is the usual case: money
+  // spent from the Veil smart wallet is free.
+  const [veilFee, setVeilFee] = useState<PlatformFee | null>(null);
+  const [spent, setSpent] = useState<number | null>(null);
+  const [waitingForPasskey, setWaitingForPasskey] = useState(false);
+
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const refreshOrders = useCallback(async () => {
+    try {
+      const orders = await getBillOrders();
+      setRecentOrders(orders);
+    } catch (err) {
+      console.warn('[airtime] failed to load recent bill orders:', errorMessage(err));
+    }
+  }, []);
+
+  const handleRecheckOrders = useCallback(async () => {
+    setIsRechecking(true);
+    try {
+      const updated = await recheckPendingBillOrders();
+      setRecentOrders(updated);
+    } catch (err) {
+      console.warn('[airtime] recheck pending bill orders failed:', errorMessage(err));
+    } finally {
+      setIsRechecking(false);
+    }
+  }, []);
+
+  // Re-check non-terminal orders on open so pending orders resolve rather
+  // than staying pending forever.
+  useEffect(() => {
+    void handleRecheckOrders();
+  }, [handleRecheckOrders]);
+
   const detected = detectNetwork(phone);
 
   // A detected network wins until the user overrides it. Ported numbers are why
@@ -184,6 +251,18 @@ export default function AirtimeScreen() {
     const check = async () => {
       try {
         const s = await getBillStatus(customerRef, orderId);
+        const token = s.token ?? s.prepaidToken;
+        if (/complete|success|delivered/i.test(s.status)) {
+          setStep('done');
+          if (token) setPrepaidToken(token);
+          await updateBillOrderStatus(orderId, s.status, token);
+          void refreshOrders();
+        }
+        if (/fail|refund|revers/i.test(s.status)) {
+          setStep('failed');
+          await updateBillOrderStatus(orderId, s.status);
+          void refreshOrders();
+        }
         // One classifier for every bill screen. This used to be an inline
         // regex that did not know "settled"/"disbursed" — the words Linq
         // actually ends a vend with — so a delivered top-up never left this
@@ -206,7 +285,7 @@ export default function AirtimeScreen() {
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = null;
     };
-  }, [orderId, customerRef, step, payHash]);
+  }, [orderId, customerRef, step, payHash, refreshOrders]);
 
   const ngn = Number(amountNGN.replace(/[^\d]/g, '')) || 0;
   const code = coin.toUpperCase();
@@ -256,6 +335,126 @@ export default function AirtimeScreen() {
     () => buildAirtimeCategoryConfig({ provider, phone }),
     [provider, phone],
   );
+  const continueFromForm = useCallback(async () => {
+    // Validate before the confirm step, naming the specific problem
+    const validation = await validateIdentifierBeforeConfirm('airtime', phone, { provider });
+    if (!validation.valid) {
+      setError(validation.error ?? 'Please check the phone number.');
+      return;
+    }
+    setError(null);
+    if (validation.accountHolderName) {
+      setAccountHolderName(validation.accountHolderName);
+    }
+    if (validation.normalizedId) {
+      setPhone(validation.normalizedId);
+    }
+
+    if (await isNairaVerified()) {
+      setStep('confirm');
+      return;
+    }
+    router.push({
+      pathname: '/verify',
+      params: {
+        returnTo: '/airtime',
+        label: 'Airtime',
+        summary: `Airtime · ₦${ngn.toLocaleString('en-NG')} to ${phone}`,
+      },
+    });
+  }, [router, ngn, phone, provider]);
+
+  const phoneValid = phoneDigits.length === 11 && phoneDigits.startsWith('0');
+
+  const pay = useCallback(async () => {
+    if (!customerRef || !refundAddress || !rate) return;
+    setStep('paying');
+    setError(null);
+    try {
+      // Reserve first, spend second. A reservation that fails costs nothing;
+      // a spend with no order behind it is money sent to an address that was
+      // never expecting it.
+      const amountStableCoin = Number((ngn / rate).toFixed(7));
+      const order = await payBill({
+        customerRef,
+        billCategory: 'airtime',
+        provider,
+        customerId: phoneDigits,
+        amountNgn: ngn,
+        amountStableCoin,
+        rate,
+        coin,
+        refundAddress,
+      });
+      setOrderId(order.id);
+      setSpent(amountStableCoin);
+
+      // Persist the bill order locally so it survives app restarts and re-queries
+      await saveBillOrder({
+        orderId: order.id,
+        customerRef,
+        category: 'airtime',
+        provider,
+        identifier: phoneDigits,
+        amount: ngn,
+        amountCrypto: amountStableCoin,
+        asset: coin,
+        status: 'pending',
+        time: Date.now(),
+      }).catch((saveErr) => {
+        console.warn('[airtime] failed to persist bill order:', errorMessage(saveErr));
+      });
+      void refreshOrders();
+
+      setWaitingForPasskey(true);
+      const issuer = coin === 'usdc' ? getAssetIssuer('USDC', 'mainnet') : null;
+      const hash = await spendAsset({
+        to: order.wallet,
+        // From the order, not from the screen: Linq settles at whatever
+        // arrives, so an amount that drifted would quietly buy less airtime.
+        amount: String(amountStableCoin),
+        ...(issuer ? { asset: { code: 'USDC', issuer } } : {}),
+        deploy: wallet.deploy,
+      });
+      setWaitingForPasskey(false);
+      setPayHash(hash);
+    } catch (err) {
+      setWaitingForPasskey(false);
+      // Back to the confirmation with the order intact and no red error: the
+      // user simply chose not to authorise, and no crypto left the wallet.
+      if (isPasskeyCancellation(err)) {
+        setError(null);
+        setStep('confirm');
+        return;
+      }
+      if (err instanceof NotEnoughToSend) {
+        setError(
+          `This wallet holds ${err.available.toLocaleString('en-US', { maximumFractionDigits: 7 })} ${code}, less than this top-up needs.`,
+        );
+      } else {
+        setError(errorMessage(err));
+      }
+      setStep('confirm');
+    }
+  }, [customerRef, refundAddress, rate, ngn, provider, phoneDigits, coin, wallet.deploy, code]);
+
+  const stepNumber = step === 'form' ? 1 : 2;
+
+  const tokenTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (tokenTimeoutRef.current) clearTimeout(tokenTimeoutRef.current);
+    };
+  }, []);
+
+  const copySuccessToken = useCallback(async () => {
+    if (!prepaidToken) return;
+    await Clipboard.setStringAsync(prepaidToken);
+    setTokenCopied(true);
+    if (tokenTimeoutRef.current) clearTimeout(tokenTimeoutRef.current);
+    tokenTimeoutRef.current = setTimeout(() => setTokenCopied(false), 2500);
+  }, [prepaidToken]);
 
   return (
     <BillFlow
@@ -276,6 +475,373 @@ export default function AirtimeScreen() {
           >
             <Text style={[styles.networkText, provider === n && styles.networkTextActive]}>
               {n}
+    <SafeAreaView style={styles.screen} edges={['top']}>
+      <View style={styles.header}>
+        <FlowHeader title="Airtime" />
+        {!mainnetOnly && (step === 'form' || step === 'confirm') ? (
+          <View style={styles.progressRow}>
+            <View style={styles.progressTrack}>
+              <View style={[styles.progressFill, { flex: stepNumber }]} />
+              <View style={{ flex: 2 - stepNumber }} />
+            </View>
+            <Text style={styles.progressLabel}>{stepNumber} / 2</Text>
+          </View>
+        ) : null}
+      </View>
+
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={16}
+      >
+        <ScrollView
+          style={styles.flex}
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={styles.body}
+          keyboardShouldPersistTaps="handled"
+        >
+        {mainnetOnly ? (
+          <View style={styles.card}>
+            <Text style={styles.eyebrow}>MAINNET ONLY</Text>
+            <Text style={styles.question}>Switch to mainnet to buy airtime</Text>
+            <Text style={styles.hint}>
+              Top-ups are vended against real crypto, so this only works on mainnet — there is
+              no test mode. Switch network in Settings, then come back.
+            </Text>
+          </View>
+        ) : null}
+
+        {error ? (
+          <View style={styles.errorCard}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        ) : null}
+
+        {/* ── b1 · form ─────────────────────────────────────────────────── */}
+        {!mainnetOnly && step === 'form' && (
+          <>
+            <Text style={styles.label}>NETWORK</Text>
+            <View style={styles.networkRow}>
+              {NETWORKS.map((n) => (
+                <Pressable
+                  key={n}
+                  onPress={() => {
+                    setProvider(n);
+                    setProviderTouched(true);
+                  }}
+                  style={[styles.networkChip, provider === n && styles.networkChipActive]}
+                >
+                  <Text style={[styles.networkText, provider === n && styles.networkTextActive]}>
+                    {n}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.field}>
+              <Text style={styles.label}>PHONE NUMBER</Text>
+              <View style={styles.phoneRow}>
+                <TextInput
+                  style={styles.phoneInput}
+                  value={phone}
+                  onChangeText={(t) => setPhone(t.replace(/[^\d]/g, '').slice(0, 11))}
+                  keyboardType="number-pad"
+                  placeholder="0803 512 4471"
+                  placeholderTextColor={colors.textMuted}
+                />
+                {/* Nobody remembers the number they are topping up. It is
+                    almost always someone else's, which is the whole reason
+                    this screen exists. */}
+                <Pressable
+                  onPress={() => void chooseContact()}
+                  accessibilityRole="button"
+                  accessibilityLabel="Choose from contacts"
+                  hitSlop={8}
+                  style={({ pressed }) => [styles.contactBtn, pressed && styles.pressed]}
+                >
+                  <ContactIcon size={17} color={colors.textSecondary} />
+                </Pressable>
+              </View>
+              {detected ? (
+                <Text style={styles.hint}>
+                  {detected} number, detected from {phoneDigits.slice(0, 4)}
+                  {providerTouched && provider !== detected ? ` — sending to ${provider}` : ''}
+                </Text>
+              ) : (
+                <Text style={styles.hint}>
+                  Numbers get ported, so check the network above matches.
+                </Text>
+              )}
+            </View>
+
+            <Text style={styles.label}>AMOUNT</Text>
+            <View style={styles.amountRow}>
+              <Text style={styles.currency}>₦</Text>
+              <TextInput
+                style={styles.amountInput}
+                value={amountNGN}
+                onChangeText={(t) => setAmountNGN(t.replace(/[^\d]/g, ''))}
+                keyboardType="number-pad"
+                placeholder="0"
+                placeholderTextColor={colors.textMuted}
+              />
+            </View>
+            <View style={styles.quickRow}>
+              {QUICK_AMOUNTS.map((q) => (
+                <Pressable key={q} onPress={() => setAmountNGN(String(q))} style={styles.quickChip}>
+                  <Text style={styles.quickText}>₦{q.toLocaleString('en-NG')}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.segment}>
+              {(['xlm', 'usdc'] as NairaCoin[]).map((c) => (
+                <Pressable
+                  key={c}
+                  onPress={() => setCoin(c)}
+                  style={[styles.segmentItem, coin === c && styles.segmentActive]}
+                >
+                  <Text style={[styles.segmentText, coin === c && styles.segmentTextActive]}>
+                    {c.toUpperCase()}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Costs</Text>
+                <Text style={styles.rowValueStrong}>
+                  {rateState === 'ready' && cost > 0
+                    ? `${cost.toFixed(coin === 'xlm' ? 4 : 2)} ${code}`
+                    : rateState === 'loading'
+                      ? 'Checking…'
+                      : '—'}
+                </Text>
+              </View>
+              {rateState === 'failed' ? (
+                <Pressable onPress={() => void loadRate()}>
+                  <Text style={styles.linkText}>Rate unavailable — try again</Text>
+                </Pressable>
+              ) : null}
+            </View>
+
+            <Pressable
+              onPress={() => void continueFromForm()}
+              disabled={!phone.trim() || ngn <= 0 || rateState !== 'ready'}
+              style={({ pressed }) => [
+                styles.primaryBtn,
+                (!phone.trim() || ngn <= 0 || rateState !== 'ready') && styles.disabled,
+                pressed && styles.pressed,
+              ]}
+            >
+              <Text style={styles.primaryText}>Continue</Text>
+            </Pressable>
+
+            <RecentBillOrders
+              orders={recentOrders}
+              onRecheck={handleRecheckOrders}
+              isRechecking={isRechecking}
+            />
+          </>
+        )}
+
+        {/* ── b2 · confirm ──────────────────────────────────────────────── */}
+        {!mainnetOnly && step === 'confirm' && (
+          <>
+            <View style={styles.card}>
+              <Text style={styles.question}>
+                {naira(ngn)} airtime to {phoneDigits} costs
+              </Text>
+              <Text style={styles.money}>
+                {cost.toFixed(coin === 'xlm' ? 4 : 2)} {code}
+              </Text>
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Network</Text>
+                <Text style={styles.rowValue}>{provider}</Text>
+              </View>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Phone</Text>
+                <Text style={styles.rowValue}>{phoneDigits}</Text>
+              </View>
+              {accountHolderName ? (
+                <View style={styles.row}>
+                  <Text style={styles.rowLabel}>Account holder</Text>
+                  <Text style={styles.rowValue}>{accountHolderName}</Text>
+                </View>
+              ) : null}
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Paid from</Text>
+                <Text style={styles.rowValue}>{code} balance</Text>
+              </View>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Network fee</Text>
+                <Text style={styles.rowValue}>Sponsored</Text>
+              </View>
+              {veilFee ? (
+                <View style={styles.row}>
+                  <Text style={styles.rowLabel}>Veil fee</Text>
+                  <Text style={styles.rowValue}>
+                    {veilFee.amount} {veilFee.assetCode}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+
+            <View style={styles.noteCard}>
+              <Text style={styles.hint}>
+                If {provider} can&apos;t complete the top-up, the full amount comes straight back
+                to this wallet.
+              </Text>
+            </View>
+
+            <SlideToConfirm label="Slide to pay" onConfirm={() => void pay()} />
+            <Text style={styles.centeredHint}>Then confirm with your passkey</Text>
+
+            <Pressable onPress={() => setStep('form')}>
+              <Text style={styles.linkText}>Back</Text>
+            </Pressable>
+          </>
+        )}
+
+        {/* ── b3 · passkey / in flight ──────────────────────────────────── */}
+        {!mainnetOnly && step === 'paying' && (
+          <>
+            <View style={styles.card}>
+              <Text style={styles.question}>
+                {waitingForPasskey ? 'Confirm with your passkey' : 'Sending your top-up'}
+              </Text>
+              <Text style={styles.hint}>
+                {waitingForPasskey
+                  ? 'Face ID, fingerprint or device PIN, whichever this phone uses.'
+                  : `${provider} is vending ${naira(ngn)} to ${phoneDigits}.`}
+              </Text>
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Airtime</Text>
+                <Text style={styles.rowValue}>
+                  {naira(ngn)} · {provider} {phoneDigits}
+                </Text>
+              </View>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>You spend</Text>
+                <Text style={styles.rowValue}>
+                  {(spent ?? cost).toFixed(coin === 'xlm' ? 4 : 2)} {code}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.waitRow}>
+              <ActivityIndicator color={colors.accent} />
+              <Text style={styles.hint}>
+                {waitingForPasskey ? 'Waiting for your passkey…' : 'Waiting for the top-up…'}
+              </Text>
+            </View>
+          </>
+        )}
+
+        {/* ── b4 · done ─────────────────────────────────────────────────── */}
+        {!mainnetOnly && step === 'done' && (
+          <>
+            <View style={styles.card}>
+              <Text style={styles.question}>Airtime sent</Text>
+              <Text style={styles.hint}>
+                {naira(ngn)} is on {phoneDigits}. It usually shows on the phone within a minute.
+              </Text>
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Network</Text>
+                <Text style={styles.rowValue}>{provider}</Text>
+              </View>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>You spent</Text>
+                <Text style={styles.rowValue}>
+                  {(spent ?? cost).toFixed(coin === 'xlm' ? 4 : 2)} {code}
+                </Text>
+              </View>
+              {orderId ? (
+                <View style={styles.row}>
+                  <Text style={styles.rowLabel}>Reference</Text>
+                  <Text style={styles.rowValue}>{orderId.slice(0, 8).toUpperCase()}</Text>
+                </View>
+              ) : null}
+            </View>
+
+            {prepaidToken ? (
+              <View style={styles.card} testID="success-prepaid-token-card">
+                <Text style={styles.label}>PREPAID TOKEN</Text>
+                <Text style={styles.tokenDisplay} selectable>
+                  {prepaidToken}
+                </Text>
+                <Pressable
+                  onPress={() => void copySuccessToken()}
+                  accessibilityRole="button"
+                  accessibilityLabel="Copy prepaid token"
+                  style={({ pressed }) => [styles.copyTokenBtn, pressed && styles.pressed]}
+                >
+                  <Text style={styles.copyTokenText}>
+                    {tokenCopied ? 'Copied to clipboard' : 'Copy Token'}
+                  </Text>
+                </Pressable>
+              </View>
+            ) : null}
+
+            <Pressable
+              onPress={() => {
+                setStep('form');
+                setAmountNGN('');
+                setOrderId(null);
+                setPayHash(null);
+                setSpent(null);
+                setPrepaidToken(null);
+                setTokenCopied(false);
+                void loadRate();
+                void refreshOrders();
+              }}
+              style={({ pressed }) => [styles.primaryBtn, pressed && styles.pressed]}
+            >
+              <Text style={styles.primaryText}>Buy again</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => router.back()}
+              style={({ pressed }) => [styles.secondaryBtn, pressed && styles.pressed]}
+            >
+              <Text style={styles.secondaryText}>Done</Text>
+            </Pressable>
+          </>
+        )}
+
+        {/* ── b5 · failed, refunding ────────────────────────────────────── */}
+        {!mainnetOnly && step === 'failed' && (
+          <>
+            <View style={styles.card}>
+              <Text style={styles.question}>Payment failed</Text>
+              <Text style={styles.hint}>
+                Your {(spent ?? cost).toFixed(coin === 'xlm' ? 4 : 2)} {code} is being returned to
+                this wallet. No airtime was added to {phoneDigits}.
+              </Text>
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>{provider} didn&apos;t complete the top-up</Text>
+                <Text style={styles.rowValue}>—</Text>
+              </View>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>Refund on its way back</Text>
+                <Text style={styles.rowValue}>Usually a few minutes</Text>
+              </View>
+            </View>
+
+            <Text style={styles.hint}>
+              Nothing for you to do. It returns to this wallet and will show in your activity.
             </Text>
           </Pressable>
         ))}
@@ -318,4 +884,185 @@ export default function AirtimeScreen() {
       </View>
     </BillFlow>
   );
+}
+
+function createStyles(colors: ThemeColors) {
+  return StyleSheet.create({
+    screen: { flex: 1, backgroundColor: colors.background },
+    flex: { flex: 1 },
+    header: { paddingHorizontal: 20, paddingTop: 16 },
+    body: { padding: 20, paddingBottom: 60, gap: 16 },
+
+    progressRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10 },
+    progressTrack: { flex: 1, flexDirection: 'row', height: 3, borderRadius: 2, backgroundColor: colors.border },
+    progressFill: { backgroundColor: colors.accent, borderRadius: 2 },
+    progressLabel: { color: colors.textMuted, fontFamily: fontFamily.body, fontSize: 12 },
+
+    card: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+      borderRadius: 16,
+      padding: 16,
+      gap: 8,
+    },
+    noteCard: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+      borderRadius: 16,
+      padding: 16,
+      backgroundColor: colors.surface,
+    },
+    errorCard: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.danger,
+      borderRadius: 12,
+      padding: 12,
+      backgroundColor: colors.dangerSurface,
+    },
+    errorText: { color: colors.danger, fontFamily: fontFamily.body, fontSize: 13, lineHeight: 19 },
+
+    eyebrow: { color: colors.textMuted, fontFamily: fontFamily.accent, fontSize: 11, letterSpacing: 0.8 },
+    question: { color: colors.textStrong, fontFamily: fontFamily.heading, fontSize: 20 },
+    hint: { color: colors.textMuted, fontFamily: fontFamily.body, fontSize: 13, lineHeight: 19 },
+    centeredHint: {
+      color: colors.textMuted,
+      fontFamily: fontFamily.body,
+      fontSize: 13,
+      textAlign: 'center',
+    },
+    money: { color: colors.textStrong, fontFamily: fontFamily.heading, fontSize: 28 },
+
+    row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 4, gap: 12 },
+    rowLabel: { color: colors.textMuted, fontFamily: fontFamily.body, fontSize: 13, flexShrink: 1 },
+    rowValue: { color: colors.textPrimary, fontFamily: fontFamily.body, fontSize: 13 },
+    rowValueStrong: { color: colors.textPrimary, fontFamily: fontFamily.bodySemiBold, fontSize: 15 },
+
+    field: { gap: 6 },
+    label: { color: colors.textMuted, fontFamily: fontFamily.accent, fontSize: 11, letterSpacing: 0.8 },
+    // The artboard draws the number on a single underline with the contact
+    // button on the right, not inside a boxed field.
+    phoneRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      paddingTop: 8,
+      paddingBottom: 10,
+      borderBottomWidth: 1.5,
+      borderBottomColor: colors.accent,
+    },
+    phoneInput: {
+      flex: 1,
+      minWidth: 0,
+      padding: 0,
+      color: colors.textStrong,
+      fontFamily: fontFamily.address,
+      fontSize: 21,
+      letterSpacing: 0.8,
+    },
+    contactBtn: {
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      alignItems: 'center',
+      justifyContent: 'center',
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+    },
+    input: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+      borderRadius: 12,
+      paddingHorizontal: 14,
+      paddingVertical: 12,
+      color: colors.textPrimary,
+      fontFamily: fontFamily.body,
+      fontSize: 16,
+    },
+
+    networkRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
+    networkChip: {
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 12,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+    },
+    networkChipActive: { backgroundColor: colors.accent, borderColor: colors.accent },
+    networkText: { color: colors.textMuted, fontFamily: fontFamily.bodySemiBold, fontSize: 13 },
+    networkTextActive: { color: colors.onAccent },
+
+    amountRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+    currency: { color: colors.textMuted, fontFamily: fontFamily.heading, fontSize: 30 },
+    amountInput: { flex: 1, color: colors.textStrong, fontFamily: fontFamily.heading, fontSize: 34, paddingVertical: 4 },
+
+    quickRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
+    quickChip: {
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 999,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+    },
+    quickText: { color: colors.textPrimary, fontFamily: fontFamily.body, fontSize: 13 },
+
+    segment: { flexDirection: 'row', gap: 8 },
+    segmentItem: {
+      flex: 1,
+      alignItems: 'center',
+      paddingVertical: 10,
+      borderRadius: 12,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+    },
+    segmentActive: { backgroundColor: colors.accent, borderColor: colors.accent },
+    segmentText: { color: colors.textMuted, fontFamily: fontFamily.bodySemiBold, fontSize: 14 },
+    segmentTextActive: { color: colors.onAccent },
+
+    waitRow: { flexDirection: 'row', alignItems: 'center', gap: 10, justifyContent: 'center', paddingVertical: 8 },
+
+    // A pill, not a rounded rectangle. Every other primary action in the app
+    // is fully rounded, and the artboard's is `--pill, 100px`.
+    primaryBtn: {
+      backgroundColor: colors.accent,
+      borderRadius: 999,
+      paddingVertical: 16,
+      alignItems: 'center',
+    },
+    primaryText: { color: colors.onAccent, fontFamily: fontFamily.bodySemiBold, fontSize: 16 },
+    secondaryBtn: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderColor: colors.border,
+      borderRadius: 999,
+      paddingVertical: 16,
+      alignItems: 'center',
+    },
+    secondaryText: { color: colors.textPrimary, fontFamily: fontFamily.bodySemiBold, fontSize: 16 },
+    linkText: { color: colors.accent, fontFamily: fontFamily.body, fontSize: 13, paddingTop: 6, textAlign: 'center' },
+
+    tokenDisplay: {
+      color: colors.accent,
+      fontFamily: fontFamily.address,
+      fontSize: 16,
+      fontWeight: '700',
+      letterSpacing: 1.2,
+      marginVertical: 6,
+    },
+    copyTokenBtn: {
+      backgroundColor: colors.surface,
+      borderColor: colors.border,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: 8,
+      paddingVertical: 10,
+      alignItems: 'center',
+      marginTop: 8,
+    },
+    copyTokenText: {
+      color: colors.textPrimary,
+      fontFamily: fontFamily.bodySemiBold,
+      fontSize: 13,
+    },
+
+    disabled: { opacity: 0.4 },
+    pressed: { opacity: 0.85 },
+  });
 }
